@@ -761,8 +761,8 @@ class h264_model {
       assert(false && "Unreachable");
       abort();
   }
-  range_t probability_for_state(range_t range, const void *context) {
-    auto* e = &estimators[get_model_key(context).actualize_model_key(this)];
+  range_t probability_for_state(range_t range, const ModelProbIndex &context) {
+    auto* e = &estimators[context.actualize_model_key(this)];
     int total = e->pos + e->neg;
     return (range/total) * e->pos;
   }
@@ -867,8 +867,8 @@ class h264_model {
       assert(false);
     }
   }
-  void update_state(int symbol, const void *context) {
-    auto* e = &estimators[get_model_key(context).actualize_model_key(this)];
+  void update_state(int symbol, const ModelProbIndex &context) {
+    auto* e = &estimators[context.actualize_model_key(this)];
     if (symbol) {
       e->pos++;
     } else {
@@ -1049,21 +1049,22 @@ class compressor {
 
     int get(uint8_t *state) {
       int symbol = ::ff_get_cabac(&ctx, state);
-
+      ModelProbIndex prior_index = model->get_model_key(state);
       size_t billable_bytes = encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, state); });
+          return model->probability_for_state(range, prior_index); });
       if (billable_bytes) {
           model->billable_bytes(billable_bytes);
       }
-      model->update_state(symbol, state);
+      model->update_state(symbol, prior_index);
       return symbol;
     }
 
     int get_bypass() {
+      ModelProbIndex prior_index =model->get_model_key(&model->bypass_context);
       int symbol = ::ff_get_cabac_bypass(&ctx);
       size_t billable_bytes = encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, &model->bypass_context); });
-      model->update_state(symbol, &model->bypass_context);
+          return model->probability_for_state(range, prior_index); });
+      model->update_state(symbol, prior_index);
       if (billable_bytes) {
           model->billable_bytes(billable_bytes);
       }
@@ -1073,12 +1074,13 @@ class compressor {
     int get_terminate() {
       int n = ::ff_get_cabac_terminate(&ctx);
       int symbol = (n != 0);
+      ModelProbIndex prior_index =model->get_model_key(&model->terminate_context);
       size_t billable_bytes = encoder.put(symbol, [&](range_t range){
-          return model->probability_for_state(range, &model->terminate_context); });
+          return model->probability_for_state(range, prior_index); });
       if (billable_bytes) {
           model->billable_bytes(billable_bytes);
       }
-      model->update_state(symbol, &model->terminate_context);
+      model->update_state(symbol, prior_index);
       if (symbol) {
         encoder.finish();
         out->set_cabac(&encoder_out[0], encoder_out.size());
@@ -1258,9 +1260,10 @@ class decompressor {
     ~cabac_decoder() { assert(out->done); }
 
     int get(uint8_t *state) {
+      ModelProbIndex prior_index = model->get_model_key(state);
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, state); });
-      model->update_state(symbol, state);
+          return model->probability_for_state(range, prior_index); });
+      model->update_state(symbol, prior_index);
       size_t billable_bytes = cabac_encoder.put(symbol, state);
       if (billable_bytes) {
           model->billable_cabac_bytes(billable_bytes);
@@ -1269,9 +1272,10 @@ class decompressor {
     }
 
     int get_bypass() {
+      ModelProbIndex prior_index = model->get_model_key(&model->bypass_context);
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, &model->bypass_context); });
-      model->update_state(symbol, &model->bypass_context);
+          return model->probability_for_state(range, prior_index); });
+      model->update_state(symbol, prior_index);
       size_t billable_bytes = cabac_encoder.put_bypass(symbol);
       if (billable_bytes) {
           model->billable_cabac_bytes(billable_bytes);
@@ -1280,9 +1284,10 @@ class decompressor {
     }
 
     int get_terminate() {
+      ModelProbIndex prior_index = model->get_model_key(&model->terminate_context);
       int symbol = decoder->get([&](range_t range){
-          return model->probability_for_state(range, &model->terminate_context); });
-      model->update_state(symbol, &model->terminate_context);
+          return model->probability_for_state(range, prior_index); });
+      model->update_state(symbol, prior_index);
       size_t billable_bytes = cabac_encoder.put_terminate(symbol);
       if (billable_bytes) {
           model->billable_cabac_bytes(billable_bytes);
