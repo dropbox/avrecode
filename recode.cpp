@@ -596,6 +596,9 @@ union ModelIndex {
 class h264_model;
 
 struct ModelProbIndex {
+  void bzero() {
+    memset(this, 0, sizeof(*this));
+  }
   const void * h264_index;
   ModelIndex indices[7];
   uint8_t num_dimensions;
@@ -609,7 +612,7 @@ struct ModelProbIndex {
   ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1);
   ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1, uint16_t value2);
 };
-
+typedef uint8_t NumPendingPops;
 
 #define STRINGIFY_COMMA(s) #s ,
 const char * billing_names [] = {EACH_PIP_CODING_TYPE(STRINGIFY_COMMA)};
@@ -823,14 +826,22 @@ class h264_model {
       break;
     }
   }
-  void update_state_tracking(int symbol) {
+  NumPendingPops update_state_tracking(int symbol) {
+    NumPendingPops retval = 0;
     switch (coding_type) {
     case PIP_SIGNIFICANCE_MAP:
       frames[cur_frame].at(mb_coord.mb_x, mb_coord.mb_y).residual[mb_coord.scan8_index * 16 + mb_coord.zigzag_index] = symbol;
       if (mb_coord.zigzag_index + 1 == sub_mb_size) {
         coding_type = PIP_UNREACHABLE;
         mb_coord.zigzag_index = 0;
+        preloaded_num_nonzeros.set_data(running_num_nonzeros);
+        ++retval;
       } else {
+        if (mb_coord.zigzag_index == 0) {
+          running_num_nonzeros = 0;
+          assert(deferred_stack.empty() && "Right now our only deferred state is NumNonzers: this assert must go away when we add more");
+          deferred_stack.push_back(&preloaded_num_nonzeros);
+        }
         if (symbol) {
           running_num_nonzeros += 1;
           coding_type = PIP_SIGNIFICANCE_EOB;
@@ -841,6 +852,8 @@ class h264_model {
               // next and last must be a one
               coding_type = PIP_UNREACHABLE;
               mb_coord.zigzag_index = 0;
+              preloaded_num_nonzeros.set_data(running_num_nonzeros);
+              ++retval;
           }
         }
       }
@@ -851,6 +864,8 @@ class h264_model {
         if (!symbol) {
           // not the EOB, so the last item must be nonzero
           running_num_nonzeros += 1;
+          preloaded_num_nonzeros.set_data(running_num_nonzeros);
+          ++retval;
         }
         coding_type = PIP_UNREACHABLE;
       } else {
@@ -866,8 +881,11 @@ class h264_model {
     default:
       assert(false);
     }
+    return retval;
   }
-  void update_state(int symbol, const ModelProbIndex &context) {
+  
+  __attribute__((warn_unused_result)) 
+  NumPendingPops update_state(int symbol, const ModelProbIndex &context) {
     auto* e = &estimators[context.actualize_model_key(this)];
     if (symbol) {
       e->pos++;
@@ -879,7 +897,7 @@ class h264_model {
       e->pos = (e->pos + 1) / 2;
       e->neg = (e->neg + 1) / 2;
     }
-    update_state_tracking(symbol);
+    return update_state_tracking(symbol);
   }
   const uint8_t bypass_context = 0, terminate_context = 0, significance_context = 0;
   CoefficientCoord mb_coord;
@@ -888,7 +906,7 @@ class h264_model {
   int sub_mb_is_dc = 0;
   int sub_mb_chroma422 = 0;
   std::vector<Future64*> deferred_stack;
-  FutureValue<uint8_t> preloaded_num_nonzeros;
+  Future64 preloaded_num_nonzeros;
   uint8_t running_num_nonzeros;
  private:
   struct estimator { int pos = 1, neg = 1; };
@@ -905,76 +923,83 @@ class h264_model {
 
 
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+}
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
-    indices[num_dimensions++].index = value0;
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+  indices[num_dimensions++].index = value0;
+}
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0, uint16_t value1) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
-    indices[num_dimensions++].index = value0;
-    indices[num_dimensions++].index = value1;
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+  indices[num_dimensions++].index = value0;
+  indices[num_dimensions++].index = value1;
+}
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0, uint16_t value1, uint16_t value2) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
-    indices[num_dimensions++].index = value0;
-    indices[num_dimensions++].index = value1;
-    indices[num_dimensions++].index = value2;
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+  indices[num_dimensions++].index = value0;
+  indices[num_dimensions++].index = value1;
+  indices[num_dimensions++].index = value2;
+}
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
-    indices[num_dimensions - 1].transform = transform;
-    indices[num_dimensions++].index = value0;
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+  indices[num_dimensions - 1].transform = transform;
+  indices[num_dimensions++].index = value0;
+}
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
-    indices[num_dimensions - 1].transform = transform;
-    indices[num_dimensions++].index = value0;
-    indices[num_dimensions++].index = value1;
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+  indices[num_dimensions - 1].transform = transform;
+  indices[num_dimensions++].index = value0;
+  indices[num_dimensions++].index = value1;
+}
 ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1, uint16_t value2) {
-    h264_index = h264_ind;
-    symbol = symbol_cache::UNKNOWN;
-    num_dimensions = (uint8_t)model->deferred_stack.size();
-    for (uint8_t i = 0; i < num_dimensions; ++i) {
-      indices[i].transform  = FutureValueTransform::IGNORE;
-    }
-    indices[num_dimensions - 1].transform = transform;
-    indices[num_dimensions++].index = value0;
-    indices[num_dimensions++].index = value1;
-    indices[num_dimensions++].index = value2;
+  bzero();
+  h264_index = h264_ind;
+  symbol = symbol_cache::UNKNOWN;
+  num_dimensions = (uint8_t)model->deferred_stack.size();
+  for (uint8_t i = 0; i < num_dimensions; ++i) {
+    indices[i].transform  = FutureValueTransform::IGNORE;
   }
+  indices[num_dimensions - 1].transform = transform;
+  indices[num_dimensions++].index = value0;
+  indices[num_dimensions++].index = value1;
+  indices[num_dimensions++].index = value2;
+}
 
 uint16_t performTransform(Future64 *value, FutureValueTransform transform) {
   return 0;
@@ -1024,6 +1049,12 @@ class compressor {
   }
 
   class cabac_decoder {
+    void popPendingDeferredState(NumPendingPops num) {
+      while(num--) {
+        assert(!model->deferred_stack.empty());
+        model->deferred_stack.pop_back();
+      }
+    }
    public:
     cabac_decoder(compressor *c, CABACContext *ctx_in, const uint8_t *buf, int size) {
       out = c->find_next_coded_block_and_emit_literal(buf, size);
@@ -1055,7 +1086,7 @@ class compressor {
       if (billable_bytes) {
           model->billable_bytes(billable_bytes);
       }
-      model->update_state(symbol, prior_index);
+      popPendingDeferredState(model->update_state(symbol, prior_index));
       return symbol;
     }
 
@@ -1064,7 +1095,7 @@ class compressor {
       int symbol = ::ff_get_cabac_bypass(&ctx);
       size_t billable_bytes = encoder.put(symbol, [&](range_t range){
           return model->probability_for_state(range, prior_index); });
-      model->update_state(symbol, prior_index);
+      popPendingDeferredState(model->update_state(symbol, prior_index));
       if (billable_bytes) {
           model->billable_bytes(billable_bytes);
       }
@@ -1080,7 +1111,7 @@ class compressor {
       if (billable_bytes) {
           model->billable_bytes(billable_bytes);
       }
-      model->update_state(symbol, prior_index);
+      popPendingDeferredState(model->update_state(symbol, prior_index));
       if (symbol) {
         encoder.finish();
         out->set_cabac(&encoder_out[0], encoder_out.size());
@@ -1238,6 +1269,12 @@ class decompressor {
   }
 
   class cabac_decoder {
+    void popPendingDeferredState(NumPendingPops num) {
+      while(num--) {
+        assert(!model->deferred_stack.empty());
+        model->deferred_stack.pop_back();
+      }
+    }
    public:
     cabac_decoder(decompressor *d, CABACContext *ctx_in, const uint8_t *buf, int size) {
       index = d->recognize_coded_block(buf, size);
@@ -1263,7 +1300,8 @@ class decompressor {
       ModelProbIndex prior_index = model->get_model_key(state);
       int symbol = decoder->get([&](range_t range){
           return model->probability_for_state(range, prior_index); });
-      model->update_state(symbol, prior_index);
+      popPendingDeferredState(model->update_state(symbol, prior_index));
+      
       size_t billable_bytes = cabac_encoder.put(symbol, state);
       if (billable_bytes) {
           model->billable_cabac_bytes(billable_bytes);
@@ -1275,7 +1313,7 @@ class decompressor {
       ModelProbIndex prior_index = model->get_model_key(&model->bypass_context);
       int symbol = decoder->get([&](range_t range){
           return model->probability_for_state(range, prior_index); });
-      model->update_state(symbol, prior_index);
+      popPendingDeferredState(model->update_state(symbol, prior_index));
       size_t billable_bytes = cabac_encoder.put_bypass(symbol);
       if (billable_bytes) {
           model->billable_cabac_bytes(billable_bytes);
@@ -1287,7 +1325,7 @@ class decompressor {
       ModelProbIndex prior_index = model->get_model_key(&model->terminate_context);
       int symbol = decoder->get([&](range_t range){
           return model->probability_for_state(range, prior_index); });
-      model->update_state(symbol, prior_index);
+      popPendingDeferredState(model->update_state(symbol, prior_index));
       size_t billable_bytes = cabac_encoder.put_terminate(symbol);
       if (billable_bytes) {
           model->billable_cabac_bytes(billable_bytes);
