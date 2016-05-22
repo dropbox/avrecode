@@ -27,6 +27,35 @@ extern "C" {
 const int SURROGATE_MARKER_BYTES = 8;
 
 
+template <typename T> class FutureValue {
+  T data;
+  bool ready;
+  public:
+  FutureValue() {
+    data = T();
+    ready = false;
+  }
+  bool is_ready() const {
+    return ready;
+  }
+  void set_data(const T& d) {
+    if (ready) {
+      assert(d == data);
+    } else {
+      ready = true;
+      data = d;
+    }
+  }
+  const T & get_data() const {
+    return data;
+  }
+  void reset() {
+    ready = false;
+    data = T();
+  }
+};
+typedef FutureValue<uint64_t> Future64;
+
 template <typename T>
 std::unique_ptr<T, std::function<void(T*&)>> av_unique_ptr(T* p, const std::function<void(T*&)>& deleter) {
   if (p == nullptr) {
@@ -189,7 +218,7 @@ class av_decoder {
       self->sub_mb_is_dc = 0;
       self->sub_mb_chroma422 = 0;
     }
-      static void begin_coding_type(void *opaque, CodingType ct,
+    static void begin_coding_type(void *opaque, CodingType ct,
                                     int zigzag_index, int param0, int param1) {
       auto *self = static_cast<av_decoder*>(opaque)->driver->get_model();
       self->begin_coding_type(ct, zigzag_index, param0, param1);
@@ -307,7 +336,7 @@ constexpr r_scan8 reverse_scan_8[15][8] = {
 typedef uint64_t range_t;
 typedef arithmetic_code<range_t, uint8_t> recoded_code;
 
-typedef std::tuple<const void*, int, int> model_key;
+typedef std::tuple<const void*, uint16_t, uint16_t, uint16_t, uint16_t> model_key;
 /*
 not sure these tables are the ones we want to use
 constexpr uint8_t unzigzag16[16] = {
@@ -543,6 +572,45 @@ bool get_neighbor_coefficient(bool above,
     output->zigzag_index = raster_to_zigzag[raster_coord] - zigzag_addition;
     return true;
 }
+
+enum class FutureValueTransform {
+  LOWEST_TRANSFORM=212,
+  IGNORE=LOWEST_TRANSFORM,
+  IDENTITY,
+  LOG2,
+  DIV2,
+  EQUAL_MAX_INDEX_SOURCE_OF_TRUTH,
+  NOT_EQUAL_MAX_INDEX_SOURCE_OF_TRUTH,
+  MAX_TRANSFORMATION,
+};
+enum class symbol_cache {
+  ZERO,
+  ONE,
+  UNKNOWN,
+};
+union ModelIndex {
+  uint16_t index;
+  FutureValueTransform transform;
+};
+
+class h264_model;
+
+struct ModelProbIndex {
+  const void * h264_index;
+  ModelIndex indices[7];
+  uint8_t num_dimensions;
+  symbol_cache symbol;
+  model_key actualize_model_key(const h264_model*model)const;
+  ModelProbIndex(const void *h264_ind, const h264_model*model);
+  ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0);
+  ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0, uint16_t value1);
+  ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0, uint16_t value1, uint16_t value2);
+  ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0);
+  ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1);
+  ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1, uint16_t value2);
+};
+
+
 #define STRINGIFY_COMMA(s) #s ,
 const char * billing_names [] = {EACH_PIP_CODING_TYPE(STRINGIFY_COMMA)};
 #undef STRINGIFY_COMMA
@@ -594,12 +662,12 @@ class h264_model {
       frames[previous ? !cur_frame : cur_frame].at(coord.mb_x, coord.mb_y).residual[coord.scan8_index * 16 + coord.zigzag_index];
       return true;
   }
-  model_key get_model_key(const void *context)const {
+  ModelProbIndex get_model_key(const void *context)const {
       switch(coding_type) {
         case PIP_UNKNOWN:
         case PIP_UNREACHABLE:
         case PIP_RESIDUALS:
-          return model_key(context, 0, 0);
+          return ModelProbIndex(context, this);
         case PIP_SIGNIFICANCE_MAP:
           {
               static const uint8_t sig_coeff_flag_offset_8x8[2][63] = {
@@ -675,15 +743,17 @@ class h264_model {
               }
               // FIXM: why doesn't this prior help at all
               //const BlockMeta &meta = frames[!cur_frame].meta_at(mb_x, mb_y);
-              return model_key(&significance_context,
-                               neighbor_left + 4 * neighbor_above + 16 * coeff_neighbor_left + 64 * coeff_neighbor_above,
-                               sub_mb_is_dc + zigzag_offset * 2 + 16 * 2 * cat_lookup[sub_mb_cat]);
+              return ModelProbIndex(&significance_context,
+                                this,
+                                FutureValueTransform::LOG2,
+                                neighbor_left + 4 * neighbor_above + 16 * coeff_neighbor_left + 64 * coeff_neighbor_above,
+                                sub_mb_is_dc + zigzag_offset * 2 + 16 * 2 * cat_lookup[sub_mb_cat]);
           }
         case PIP_SIGNIFICANCE_EOB:
           {
             // FIXME: why doesn't this prior help at all
             //const BlockMeta &meta = frames[!cur_frame].meta_at(mb_x, mb_y);
-            return model_key(context, 0/*meta.num_nonzeros[sub_mb_index]*/, 0);//;
+            return ModelProbIndex(context, this, FutureValueTransform::EQUAL_MAX_INDEX_SOURCE_OF_TRUTH, running_num_nonzeros);// don't need to encode EOB with NumNonzeros
           }
         default:
           break;
@@ -692,7 +762,7 @@ class h264_model {
       abort();
   }
   range_t probability_for_state(range_t range, const void *context) {
-    auto* e = &estimators[get_model_key(context)];
+    auto* e = &estimators[get_model_key(context).actualize_model_key(this)];
     int total = e->pos + e->neg;
     return (range/total) * e->pos;
   }
@@ -740,6 +810,8 @@ class h264_model {
     coding_type = ct;
     switch (ct) {
     case PIP_SIGNIFICANCE_MAP:
+      running_num_nonzeros = 0;
+      preloaded_num_nonzeros.reset();
       assert(!zz_index);
       if (sub_mb_is_dc) {
         mb_coord.zigzag_index = 0;
@@ -760,6 +832,7 @@ class h264_model {
         mb_coord.zigzag_index = 0;
       } else {
         if (symbol) {
+          running_num_nonzeros += 1;
           coding_type = PIP_SIGNIFICANCE_EOB;
         } else {
           ++mb_coord.zigzag_index;
@@ -775,6 +848,10 @@ class h264_model {
     case PIP_SIGNIFICANCE_EOB:
       if (symbol || mb_coord.zigzag_index + 2 == sub_mb_size) {
         mb_coord.zigzag_index = 0;
+        if (!symbol) {
+          // not the EOB, so the last item must be nonzero
+          running_num_nonzeros += 1;
+        }
         coding_type = PIP_UNREACHABLE;
       } else {
         coding_type = PIP_SIGNIFICANCE_MAP;
@@ -791,7 +868,7 @@ class h264_model {
     }
   }
   void update_state(int symbol, const void *context) {
-    auto* e = &estimators[get_model_key(context)];
+    auto* e = &estimators[get_model_key(context).actualize_model_key(this)];
     if (symbol) {
       e->pos++;
     } else {
@@ -804,18 +881,115 @@ class h264_model {
     }
     update_state_tracking(symbol);
   }
-
   const uint8_t bypass_context = 0, terminate_context = 0, significance_context = 0;
   CoefficientCoord mb_coord;
   int sub_mb_cat = -1;
   int sub_mb_size = -1;
   int sub_mb_is_dc = 0;
   int sub_mb_chroma422 = 0;
+  std::vector<Future64*> deferred_stack;
+  FutureValue<uint8_t> preloaded_num_nonzeros;
+  uint8_t running_num_nonzeros;
  private:
   struct estimator { int pos = 1, neg = 1; };
   std::map<model_key, estimator> estimators;
 };
 
+
+
+
+
+
+
+
+
+
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+  }
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+    indices[num_dimensions++].index = value0;
+  }
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0, uint16_t value1) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+    indices[num_dimensions++].index = value0;
+    indices[num_dimensions++].index = value1;
+  }
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, uint16_t value0, uint16_t value1, uint16_t value2) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+    indices[num_dimensions++].index = value0;
+    indices[num_dimensions++].index = value1;
+    indices[num_dimensions++].index = value2;
+  }
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+    indices[num_dimensions - 1].transform = transform;
+    indices[num_dimensions++].index = value0;
+  }
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+    indices[num_dimensions - 1].transform = transform;
+    indices[num_dimensions++].index = value0;
+    indices[num_dimensions++].index = value1;
+  }
+ModelProbIndex::ModelProbIndex(const void *h264_ind, const h264_model*model, FutureValueTransform transform, uint16_t value0, uint16_t value1, uint16_t value2) {
+    h264_index = h264_ind;
+    symbol = symbol_cache::UNKNOWN;
+    num_dimensions = (uint8_t)model->deferred_stack.size();
+    for (uint8_t i = 0; i < num_dimensions; ++i) {
+      indices[i].transform  = FutureValueTransform::IGNORE;
+    }
+    indices[num_dimensions - 1].transform = transform;
+    indices[num_dimensions++].index = value0;
+    indices[num_dimensions++].index = value1;
+    indices[num_dimensions++].index = value2;
+  }
+
+uint16_t performTransform(Future64 *value, FutureValueTransform transform) {
+  return 0;
+}
+model_key ModelProbIndex::actualize_model_key(const h264_model*model) const {
+  uint16_t values[4] = {0, 0, 0, 0};
+  uint16_t index = 0;
+  for (;index < model->deferred_stack.size() && index < sizeof(values)/sizeof(values[0]); ++index) {
+    values[index] = performTransform(model->deferred_stack[index], indices[index].transform);
+  }
+  for (;index < num_dimensions && index < sizeof(values)/ sizeof(values[0]); ++index) {
+    values[index] = indices[index].index;
+  }
+  return model_key(model, values[0], values[1], values[2], values[3]);
+}
 
 class compressor {
  public:
