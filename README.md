@@ -38,7 +38,8 @@ git submodule update --init
 Build and test:
 
 ```
-brew install protobuf
+brew install protobuf # for macOS
+# apt-get -y build-essential git yasm pkg-config protobuf-compiler libprotobuf-dev # uncomment for Ubuntu 16.04
 cd ffmpeg
 ./configure
 make
